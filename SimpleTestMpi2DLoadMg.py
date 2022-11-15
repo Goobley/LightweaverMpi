@@ -73,7 +73,7 @@ aSet = lw.RadiativeSet(
     ]
 )
 aSet.set_detailed_static("H")
-aSet.set_active("Ca")
+aSet.set_active("Mg")
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
@@ -92,14 +92,12 @@ visitors = {
     "wavelength": WavelengthVisitor(),
     "I": IntensityVisitor(),
 }
-root_only = ["wavelength", "I"]
+root_only = ["Mg", ("Mg", 0), ("Mg", 1), "wavelength", "I"]
 ser = ZarrLwVisitorSerializer(visitors)
 
 ser.load(stacked, "Mpi2d.zarr", ignore=root_only)
 
-dJ = 1.0
-while dJ > 1e-4:
-    dJ = stacked.formal_sol_gamma_matrices().dJMax
+lw.iterate_ctx_se(stacked, prd=True, quiet=(rank != 0), popsTol=1e-2, JTol=3e-2)
 
 if rank == 0:
     plt.ion()

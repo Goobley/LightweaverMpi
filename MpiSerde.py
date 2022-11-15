@@ -1,25 +1,31 @@
 import pathlib
 import pickle
 from abc import abstractmethod
-from logging import root
-from typing import Any, Dict, List, Optional, Protocol, Tuple, TypeVar
+from typing import Any, Dict, List, Optional, Protocol, Tuple, TypeVar, Union
 
 import lightweaver as lw
 import numpy as np
 import zarr
+from weno4 import weno4
 
 from MpiStackedContext import MpiStackedContext
 
+VisitorResult = Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]
 
 class LwVisitor(Protocol):
     """API for visitors for extracting and injecting state into a context.
 
-    N.B. all state arrays coming through these functions is expected to have z as its second axis. This means that wavelength/number of levels remains the first axis, then populations as usual, z, y, x. For some, like ne, this requires the creation of a unit-length first axis."""
+    N.B. all state arrays coming through these functions is expected to have z
+    as its second axis. This means that wavelength/number of levels remains the
+    first axis, then populations as usual, z, y, x. For some, like ne, this
+    requires the creation of a unit-length first axis.  Also added the option
+    for this to be a tuple of two arrays to better support RhoPrd stuff. In this
+    instance, the first array is assumed to be invariant in space."""
 
-    def __call__(self, ctx: lw.Context, remove_ghost: bool = True) -> np.ndarray:
+    def __call__(self, ctx: lw.Context, remove_ghost: bool = True) -> VisitorResult:
         raise NotImplementedError
 
-    def set(self, ctx: lw.Context, val: np.ndarray):
+    def set(self, ctx: lw.Context, val: VisitorResult):
         raise NotImplementedError
 
     def shape(self, ctx: lw.Context) -> Tuple:
@@ -94,26 +100,54 @@ class RhoPrdVisitor(LwVisitor):
         self.atom_idx = atom_idx
         self.trans_idx = trans_idx
 
+    def get_trans(self, ctx: lw.Context):
+        raise NotImplementedError()
+
     def get_rho(self, ctx: lw.Context):
-        result = ctx.activeAtoms[self.atom_idx].trans[self.trans_idx].rhoPrd
+        result = self.get_trans(ctx).rhoPrd
         if ctx.atmos.Ndim != 1:
             result = result.reshape(-1, ctx.atmos.Nz, ctx.atmos.Nx)
         return result
 
-    def __call__(self, ctx: lw.Context, remove_ghost: bool = True):
-        result = self.get_rho(ctx)
+    def get_wavelength(self, ctx: lw.Context):
+        wl = self.get_trans(ctx).wavelength
+        return wl
+
+    def __call__(self, ctx: lw.Context, remove_ghost: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+        rho = self.get_rho(ctx)
+        wl = self.get_wavelength(ctx)
 
         if remove_ghost:
-            return result[:, ctx.cstart : ctx.cend]
-        return result
+            rho = rho[:, ctx.cstart : ctx.cend]
 
-    def set(self, ctx: lw.Context, val: np.ndarray):
+        return (wl, rho)
+
+    def set(self, ctx: lw.Context, val: VisitorResult):
         rho = self.get_rho(ctx)
-        rho[...] = val
+        if isinstance(val, tuple):
+            if np.array_equiv(val[0], self.get_wavelength(ctx)):
+                rho[...] = val[1]
+            else:
+                saved_wl = val[0]
+                ctx_wl = self.get_wavelength(ctx)
+                for k in np.ndindex(rho.shape[1:]):
+                    k_idx = (slice(None, None), *k)
+                    rho.__setitem__(k_idx, weno4(ctx_wl, saved_wl, val[1].__getitem__(k_idx)))
+        else:
+                rho[...] = val
 
     def shape(self, ctx: lw.Context):
-        return self.get_rho(ctx).shape
+        return (self.get_wavelength(ctx).shape, self.get_rho(ctx).shape)
 
+
+class ActiveRhoPrdVisitor(RhoPrdVisitor):
+    def get_trans(self, ctx: lw.Context):
+        return ctx.activeAtoms[self.atom_idx].trans[self.trans_idx]
+
+
+class DetailedStaticRhoPrdVisitor(RhoPrdVisitor):
+    def get_trans(self, ctx: lw.Context):
+        return ctx.detailedAtoms[self.atom_idx].trans[self.trans_idx]
 
 class WavelengthVisitor(LwVisitor):
     """Gather the wavelength array (same on every node, see `root_only`)"""
@@ -145,43 +179,63 @@ def gather_visitor_mpi_ctx(
     ctx: MpiStackedContext,
     visitor: LwVisitor,
     root: int = 0,
-) -> Optional[np.ndarray]:
+) -> Optional[VisitorResult]:
     """Use a visitor to gather a quantity from all nodes to the root node."""
 
     rank = ctx.rank
     comm = ctx.comm
     result = None
+    got_tuple = False
 
     if rank != root:
-        send_buf = np.ascontiguousarray(visitor(ctx, remove_ghost=True))
-
-        comm.Send(send_buf, dest=root)
+        msg = visitor(ctx, remove_ghost=True)
+        if isinstance(msg, np.ndarray):
+            send_buf = np.ascontiguousarray(msg)
+            comm.Send(send_buf, dest=root)
+        else:
+            comm.send(msg, dest=root)
     else:
         self_buffer = visitor(ctx, remove_ghost=True)
-        if ctx.atmos.Ndim == 1:
-            result = np.zeros((self_buffer.shape[0], ctx.global_atmos.Nz))
+        if isinstance(self_buffer, np.ndarray):
+            if ctx.atmos.Ndim == 1:
+                result = np.zeros((self_buffer.shape[0], ctx.global_atmos.Nz))
+            else:
+                result = np.zeros(
+                    (self_buffer.shape[0], ctx.global_atmos.Nz, ctx.global_atmos.Nx)
+                )
         else:
-            result = np.zeros(
-                (self_buffer.shape[0], ctx.global_atmos.Nz, ctx.global_atmos.Nx)
-            )
+            got_tuple = True
+            tuple_buffer = self_buffer
+            self_buffer = tuple_buffer[1]
+            if ctx.atmos.Ndim == 1:
+                tuple_result = (tuple_buffer[0], np.zeros((self_buffer.shape[0], ctx.global_atmos.Nz)))
+            else:
+                tuple_result = (tuple_buffer[0], np.zeros(
+                    (self_buffer.shape[0], ctx.global_atmos.Nz, ctx.global_atmos.Nx))
+                )
+            result = tuple_result[1]
 
         z_start = 0
         for recv_rank in range(ctx.Nchunks):
             if recv_rank != root:
-                if ctx.atmos.Ndim == 1:
-                    recv_buf = np.zeros(
-                        (self_buffer.shape[0], ctx.ctx_sizes[recv_rank])
-                    )
+                if got_tuple:
+                    received = comm.recv(source=recv_rank)
+                    recv_buf = received[1]
                 else:
-                    recv_buf = np.zeros(
-                        (
-                            self_buffer.shape[0],
-                            ctx.ctx_sizes[recv_rank],
-                            ctx.global_atmos.Nx,
+                    if ctx.atmos.Ndim == 1:
+                        recv_buf = np.zeros(
+                            (self_buffer.shape[0], ctx.ctx_sizes[recv_rank])
                         )
-                    )
+                    else:
+                        recv_buf = np.zeros(
+                            (
+                                self_buffer.shape[0],
+                                ctx.ctx_sizes[recv_rank],
+                                ctx.global_atmos.Nx,
+                            )
+                        )
 
-                comm.Recv(recv_buf, source=recv_rank)
+                    comm.Recv(recv_buf, source=recv_rank)
             else:
                 recv_buf = self_buffer
 
@@ -189,6 +243,8 @@ def gather_visitor_mpi_ctx(
             result[:, z_start:z_end] = recv_buf
             z_start += ctx.ctx_sizes[recv_rank]
 
+    if got_tuple:
+        return tuple_result
     return result
 
 
@@ -197,8 +253,10 @@ def gather_mpi_to_dict(
     visitors: Dict[Any, LwVisitor],
     root: int = 0,
     root_only: Optional[List[Any]] = None,
-) -> Dict[Any, np.ndarray]:
-    """Gather from a dict of visitors across all nodes to a dict of full arrays on the root node. Keys in `root_only` will only be run on the root (e.g. wavelength/I)."""
+) -> Dict[Any, VisitorResult]:
+    """Gather from a dict of visitors across all nodes to a dict of full arrays
+    on the root node. Keys in `root_only` will only be run on the root (e.g.
+    wavelength/I)."""
 
     if root_only is None:
         root_only = []
@@ -221,39 +279,59 @@ def gather_mpi_to_dict(
 def make_pops_visitors(ctx: MpiStackedContext):
     """Return a dict of visitors for the NLTE populations in a Context."""
     active_atoms = [a.element for a in ctx.aSet.activeAtoms]
-    return {a.name: PopsVisitor(a.name) for a in active_atoms}
+    detailed_atoms = [a.element for a in ctx.aSet.detailedAtoms]
+    return {a.name: PopsVisitor(a.name) for a in active_atoms + detailed_atoms}
 
 
 def make_prd_visitors(ctx: MpiStackedContext):
     """Return a dict of PRD rho visitors for PRD transitions in a Context."""
-    active_atoms = [a.element for a in ctx.aSet.activeAtoms]
+    active_atoms = [a.element.name for a in ctx.aSet.activeAtoms]
+    detailed_atoms = [a.element.name for a in ctx.aSet.detailedAtoms]
+
+    atom_lists = [ctx.activeAtoms, ctx.detailedAtoms]
+    name_lists = [active_atoms, detailed_atoms]
+    visitor_types = [ActiveRhoPrdVisitor, DetailedStaticRhoPrdVisitor]
 
     visitors = {}
-    for ia, a in enumerate(ctx.activeAtoms):
-        for it, t in enumerate(a.trans):
-            try:
-                t.rhoPrd
-            except AttributeError:
-                continue
-            visitors[(active_atoms[ia].name, it)] = RhoPrdVisitor(ia, it)
+    for atoms, names, Vis in zip(atom_lists, name_lists, visitor_types):
+        for ia, a in enumerate(atoms):
+            for it, t in enumerate(a.trans):
+                try:
+                    t.rhoPrd
+                except AttributeError:
+                    continue
+                visitors[(names[ia], it)] = Vis(ia, it)
     return visitors
 
 
 def scatter_visitor_mpi_ctx(
     ctx: MpiStackedContext,
     visitor: LwVisitor,
-    data: Optional[np.ndarray],
+    data: Optional[VisitorResult],
     root: int = 0,
 ):
     """Use a visitor to scatter an array on the root node across all nodes."""
     if ctx.rank != root:
         shape = visitor.shape(ctx)
-        data = np.zeros(shape)
+        got_tuple = False
+        if len(shape) > 0 and isinstance(shape[0], tuple):
+            got_tuple = True
 
-        ctx.comm.Recv(data, source=root)
+        if got_tuple:
+            data = ctx.comm.recv(source=root)
+        else:
+            data = np.zeros(shape)
+            ctx.comm.Recv(data, source=root)
+
         visitor.set(ctx, data)
     else:
         z_start = 0
+        got_tuple = False
+        if isinstance(data, tuple):
+            got_tuple = True
+            tuple_data = data
+            data = tuple_data[1]
+
         for i, s in enumerate(ctx.ctx_sizes):
             z_ghost_start = z_start
             z_ghost_end = z_start + s
@@ -267,16 +345,23 @@ def scatter_visitor_mpi_ctx(
 
             z_start += s
 
-            if i != root:
-                ctx.comm.Send(send_slice, dest=i)
+            if got_tuple:
+                send_msg = (tuple_data[0], send_slice)
+                if i != root:
+                    ctx.comm.send(send_msg, dest=i)
+                else:
+                    visitor.set(ctx, send_msg)
             else:
-                visitor.set(ctx, send_slice)
+                if i != root:
+                    ctx.comm.Send(send_slice, dest=i)
+                else:
+                    visitor.set(ctx, send_slice)
 
 
 def scatter_mpi_from_dict(
     ctx: MpiStackedContext,
     visitors: Dict[Any, LwVisitor],
-    data: Optional[Dict[Any, np.ndarray]],
+    data: Optional[Dict[Any, Optional[VisitorResult]]],
     root: int = 0,
     ignore: Optional[List[Any]] = None,
 ):
@@ -310,7 +395,7 @@ class LwVisitorSerializer:
         self,
         instance: MpiStackedContext,
         root_only: Optional[List[Any]] = None,
-    ) -> Dict[Any, np.ndarray]:
+    ) -> Dict[Any, VisitorResult]:
         """Serialize a class instance: gathers to root node."""
 
         return gather_mpi_to_dict(
@@ -323,7 +408,7 @@ class LwVisitorSerializer:
     def deserialize(
         self,
         target: MpiStackedContext,
-        data: Optional[Dict[Any, np.ndarray]],
+        data: Optional[Dict[Any, VisitorResult]],
         ignore: Optional[List[Any]] = None,
     ):
         """Deserialize an instance (by scattering) into the provided target per node."""
@@ -401,7 +486,11 @@ class ZarrLwVisitorSerializer(LwVisitorSerializer):
         if instance.rank == self.root:
             file = zarr.convenience.open(path, "w")
             for k, v in data.items():
-                file[k] = v
+                if isinstance(v, tuple):
+                    for idx, vv in enumerate(v):
+                        file[f"{k}__{idx}"] = vv
+                else:
+                    file[k] = v
 
     def load(
         self,
@@ -416,6 +505,16 @@ class ZarrLwVisitorSerializer(LwVisitorSerializer):
 
             data = {}
             for k in self.visitors.keys():
-                data[k] = file[k][...]
+                try:
+                    if isinstance(k, tuple):
+                        result = []
+                        for idx in range(len(k)):
+                            result.append(file[f"{k}__{idx}"][...])
+                        data[k] = tuple(result)
+                    else:
+                        data[k] = file[k][...]
+                except KeyError:
+                    if k in ignore:
+                        continue
 
         self.deserialize(target, data, ignore=ignore)

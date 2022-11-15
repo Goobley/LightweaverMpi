@@ -84,7 +84,7 @@ stacked = MpiStackedContext(
     atmos, aSet, num_nodes, comm, ctx_kwargs={"Nthreads": Nthreads}
 )
 
-lw.iterate_ctx_se(stacked, prd=True, quiet=(rank != 0))
+lw.iterate_ctx_se(stacked, prd=True, quiet=(rank != 0), popsTol=1e-2, JTol=3e-2)
 
 
 visitors = {
